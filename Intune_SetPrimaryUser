@@ -3,7 +3,7 @@
 # Author  : Nick Butcher
 # GitHub  : https://github.com/nihkb007/Intune-Repository
 # Created : 2026-02-19
-# Version : 1.0
+# Version : 1.1
 #
 # Description:
 # Automatically assigns or clears the Primary User on Windows devices in Intune
@@ -37,20 +37,19 @@ Optional:
 # CONFIGURATION
 # =========================================
 
-# Azure App Registration
+# Azure App Registration (REPLACE WITH YOUR VALUES)
 $TenantId     = "<TENANT_ID>"
 $ClientId     = "<CLIENT_ID>"
 $ClientSecret = "<CLIENT_SECRET>"
 
 # Device Processing Settings
-$TimeframeDays   = 7        # Look back X days for sign-ins
-$RecentHours     = 1        # Only process devices synced in last X hours
-$DeviceBatchSize = 500      # Devices per run
-$SignInBatchSize = 15       # Devices per Graph sign-in query batch
+$TimeframeDays   = 7
+$RecentHours     = 1
+$DeviceBatchSize = 500
+$SignInBatchSize = 15
 
 # Mode Options: Report | Test | Live
 $Mode = "Report"
-$UpdateEachStep = $false
 
 # Logging
 $LogPath          = "C:\Logs"
@@ -58,23 +57,13 @@ $LogFileName      = "Intune_PrimaryUser.log"
 $LogRetentionDays = 30
 $LogFile          = Join-Path $LogPath $LogFileName
 
-# Email Notifications (Optional)
-$EnableEmail = $false
-$EmailParams = @{
-    To         = "admin@yourdomain.com"
-    From       = "automation@yourdomain.com"
-    SmtpServer = "smtp.yourdomain.com"
-    Subject    = "Intune Primary User Script FAILED - $(Get-Date -Format yyyy-MM-dd)"
-}
+# =========================================
+# INITIALIZATION
+# =========================================
 
-# Ensure log directory exists
 if (-not (Test-Path $LogPath)) {
     New-Item -ItemType Directory -Path $LogPath -Force | Out-Null
 }
-
-# =========================================
-# FUNCTIONS
-# =========================================
 
 function Write-ChangeLog {
     param ([string]$Message)
@@ -100,31 +89,6 @@ function Trim-LogFile {
     $FilteredLines | Set-Content -Path $LogFile -Encoding UTF8
 }
 
-function Send-FailureEmail {
-    param ([string]$ErrorMessage)
-
-    if (-not $EnableEmail) { return }
-
-    try {
-        $Body = @"
-Intune Primary User Script Failure
-
-Date: $(Get-Date)
-
-Error Details:
-$ErrorMessage
-"@
-        Send-MailMessage @EmailParams -Body $Body
-    }
-    catch {
-        Write-Warning "Email notification failed."
-    }
-}
-
-# =========================================
-# INITIALIZATION
-# =========================================
-
 Trim-LogFile
 
 $StartTime = Get-Date
@@ -132,7 +96,6 @@ $TotalDevicesProcessed = 0
 $SingleUserUpdated    = 0
 $SharedDevicesCleared = 0
 $DevicesNoSignIns     = 0
-$DevicesErrors        = 0
 
 # =========================================
 # AUTHENTICATION
@@ -140,33 +103,27 @@ $DevicesErrors        = 0
 
 Write-Host "Authenticating to Microsoft Graph..." -ForegroundColor Cyan
 
-try {
-    $Body = @{
-        grant_type    = "client_credentials"
-        scope         = "https://graph.microsoft.com/.default"
-        client_id     = $ClientId
-        client_secret = $ClientSecret
-    }
-
-    $TokenResponse = Invoke-RestMethod -Method Post `
-        -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-        -Body $Body
-
-    $Headers = @{
-        Authorization  = "Bearer $($TokenResponse.access_token)"
-        "Content-Type" = "application/json"
-    }
+$Body = @{
+    grant_type    = "client_credentials"
+    scope         = "https://graph.microsoft.com/.default"
+    client_id     = $ClientId
+    client_secret = $ClientSecret
 }
-catch {
-    Send-FailureEmail $_.Exception.Message
-    throw
+
+$TokenResponse = Invoke-RestMethod -Method Post `
+    -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+    -Body $Body
+
+$Headers = @{
+    Authorization  = "Bearer $($TokenResponse.access_token)"
+    "Content-Type" = "application/json"
 }
 
 # =========================================
 # DEVICE RETRIEVAL
 # =========================================
 
-Write-Host "Retrieving devices..." -ForegroundColor Cyan
+Write-Host "Retrieving devices from Intune..." -ForegroundColor Cyan
 
 $Devices = @()
 $Uri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices"
@@ -178,25 +135,40 @@ do {
 }
 while ($Uri)
 
+Write-Host "Total devices retrieved: $($Devices.Count)" -ForegroundColor Yellow
+
 $Devices = $Devices | Where-Object { $_.operatingSystem -eq "Windows" }
 
-$Cutoff = (Get-Date).ToUniversalTime().AddHours(-$RecentHours)
+$SyncCutoffStart = (Get-Date).ToUniversalTime().AddHours(-$RecentHours)
+$SyncCutoffEnd   = (Get-Date).ToUniversalTime()
 
 $Devices = $Devices |
-    Where-Object { $_.lastSyncDateTime -and ([datetime]$_.lastSyncDateTime).ToUniversalTime() -ge $Cutoff } |
+    Where-Object {
+        $_.lastSyncDateTime -and
+        ([datetime]$_.lastSyncDateTime).ToUniversalTime() -ge $SyncCutoffStart
+    } |
     Sort-Object {[datetime]$_.lastSyncDateTime} -Descending |
     Select-Object -First $DeviceBatchSize
 
-Write-Host "Devices selected: $($Devices.Count)" -ForegroundColor Green
+Write-Host "Devices selected for processing: $($Devices.Count) | Sync timeframe: $($SyncCutoffStart.ToLocalTime()) to $($SyncCutoffEnd.ToLocalTime())" -ForegroundColor Green
+Write-Host ""
 
 # =========================================
-# SIGN-IN RETRIEVAL (Batch Optimized)
+# SIGN-IN RETRIEVAL
 # =========================================
+
+Write-Host "Retrieving sign-ins in controlled batches..." -ForegroundColor Cyan
 
 $StartDate = (Get-Date).ToUniversalTime().AddDays(-$TimeframeDays).ToString("yyyy-MM-ddTHH:mm:ssZ")
 $AllSignIns = @()
 
+$BatchCount = [math]::Ceiling($Devices.Count / $SignInBatchSize)
+$BatchNumber = 0
+
 for ($i = 0; $i -lt $Devices.Count; $i += $SignInBatchSize) {
+
+    $BatchNumber++
+    Write-Host "  Processing sign-in batch $BatchNumber of $BatchCount..." -ForegroundColor DarkGray
 
     $Batch = $Devices[$i..([math]::Min($i + $SignInBatchSize - 1, $Devices.Count - 1))]
 
@@ -218,19 +190,27 @@ for ($i = 0; $i -lt $Devices.Count; $i += $SignInBatchSize) {
     while ($SignInUri)
 }
 
-Write-Host "Sign-ins retrieved: $($AllSignIns.Count)" -ForegroundColor Green
+Write-Host "Total sign-ins retrieved for selected devices: $($AllSignIns.Count)" -ForegroundColor Green
+Write-Host ""
 
 # =========================================
 # PROCESS DEVICES
 # =========================================
 
+$DeviceIndex = 0
+$TotalDeviceCount = $Devices.Count
+
 foreach ($Device in $Devices) {
+
+    $DeviceIndex++
+    Write-Host "Processing device $DeviceIndex of $TotalDeviceCount $($Device.deviceName)" -ForegroundColor White
 
     $DeviceSignIns = $AllSignIns | Where-Object {
         $_.deviceDetail.displayName -eq $Device.deviceName
     }
 
     if (-not $DeviceSignIns) {
+        Write-Host "  No sign-ins found within $TimeframeDays days." -ForegroundColor DarkYellow
         $DevicesNoSignIns++
         continue
     }
@@ -242,6 +222,9 @@ foreach ($Device in $Devices) {
 
     if ($Users.Count -gt 1) {
 
+        Write-Host "  Multiple users detected: $($Users -join ', ')" -ForegroundColor Yellow
+        Write-Host "  Device will be set as Shared." -ForegroundColor Yellow
+
         if ($CurrentPrimary -and $Mode -eq "Live") {
             $DeleteUri = "https://graph.microsoft.com/beta/deviceManagement/managedDevices/$($Device.id)/users/`$ref"
             Invoke-RestMethod -Uri $DeleteUri -Headers $Headers -Method DELETE
@@ -250,6 +233,10 @@ foreach ($Device in $Devices) {
         }
     }
     else {
+
+        Write-Host "  Single user detected: $LastUser" -ForegroundColor Green
+        Write-Host "  Current Primary User: $CurrentPrimary"
+
         if (-not $CurrentPrimary -or $CurrentPrimary -ne $LastUser) {
 
             if ($Mode -eq "Live") {
@@ -268,6 +255,7 @@ foreach ($Device in $Devices) {
     }
 
     $TotalDevicesProcessed++
+    Write-Host ""
 }
 
 # =========================================
@@ -276,7 +264,6 @@ foreach ($Device in $Devices) {
 
 $Duration = New-TimeSpan -Start $StartTime -End (Get-Date)
 
-Write-Host ""
 Write-Host "================== Run Summary =================="
 Write-Host "Total devices processed : $TotalDevicesProcessed"
 Write-Host "Primary users updated   : $SingleUserUpdated"
